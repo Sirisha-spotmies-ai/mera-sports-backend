@@ -3,6 +3,7 @@ import { supabaseAdmin } from "../config/supabaseClient.js";
 import { cacheGet, cacheSet, cacheDel } from "../config/redisClient.js";
 import { getPublicEventId, resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 import { PAYMENT_GATEWAYS, PAYMENT_SETTING_FIELDS, acceptsManual, normalizePaymentGateway } from "../utils/paymentGateway.js";
+import { invalidateEventAccessCache } from "../middleware/eventAccess.js";
 import { isCategoryDeadlinePassed } from "../utils/registrationWindow.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 
@@ -50,6 +51,31 @@ const getAssignedEventIdsForAdmin = async (adminId) => {
         console.error('getAssignedEventIdsForAdmin error:', err?.message || err);
         return [];
     }
+};
+
+// ── Which fields a create/edit request may set ───────────────────────────────
+// Everything else in the body (created_by, qr_code, public_id, assigned_by…)
+// is ignored. Before this, both handlers wrote whatever the client sent.
+const EVENT_EDITABLE_FIELDS = [
+    "name", "sport", "location", "venue", "start_date", "end_date", "start_time",
+    "banner_image", "document_file", "document_url", "document_description", "is_document_required",
+    "rules_and_regulations", "sponsors", "categories", "pincode", "state", "city",
+    "google_map_link", "show_slots", "event_format_type",
+];
+// Who runs an event and its lifecycle status are the superadmin's call.
+const SUPERADMIN_ONLY_EVENT_FIELDS = ["assigned_admin_ids", "assigned_to", "status"];
+
+const pickEventFields = (body, { superadmin, includePayment }) => {
+    const allowed = [
+        ...EVENT_EDITABLE_FIELDS,
+        ...(superadmin ? SUPERADMIN_ONLY_EVENT_FIELDS : []),
+        ...(includePayment ? PAYMENT_SETTING_FIELDS : []),
+    ];
+    const picked = {};
+    for (const field of allowed) {
+        if (Object.prototype.hasOwnProperty.call(body || {}, field)) picked[field] = body[field];
+    }
+    return picked;
 };
 
 const loadAssignedAdminsForEvent = async (eventId) => {
@@ -115,6 +141,7 @@ const syncEventAdminAssignments = async (eventId, adminIds, assignedBy) => {
         if (insertError.code === '42P01') return;
         throw insertError;
     }
+    await invalidateEventAccessCache("*", normalizedEventId);
 };
 
 // GET /api/events/list
@@ -296,7 +323,9 @@ export const createEvent = async (req, res) => {
         }
 
         const created_by = req.user.id;
-        const normalizedAssignedAdminIds = Array.isArray(assigned_admin_ids)
+        const isSuperAdmin = req.user?.role === 'superadmin';
+        // Only a superadmin assigns admins; anyone else's choice is ignored.
+        const normalizedAssignedAdminIds = !isSuperAdmin ? [] : Array.isArray(assigned_admin_ids)
             ? Array.from(new Set(assigned_admin_ids.filter(isUuid)))
             : (assigned_to && isUuid(assigned_to) ? [assigned_to] : []);
         const primaryAssignedAdminId = normalizedAssignedAdminIds[0] || null;
@@ -327,7 +356,8 @@ export const createEvent = async (req, res) => {
             status: 'upcoming',
             assigned_to: primaryAssignedAdminId,
             assigned_by: primaryAssignedAdminId ? created_by : null,
-            ...rest
+            // upi_id rides in here: payment settings are open at creation.
+            ...pickEventFields(rest, { superadmin: isSuperAdmin, includePayment: true })
         }).select().single();
 
         if (error) throw error;
@@ -407,15 +437,15 @@ export const createEvent = async (req, res) => {
 export const updateEvent = async (req, res) => {
     try {
         const { id } = req.params;
-        const updates = req.body;
+        const isSuperAdmin = req.user?.role === 'superadmin';
+        // Only known fields are written. Payment settings are fixed at creation
+        // and, like admin assignment, only a superadmin may change them; for
+        // anyone else they are dropped rather than rejected, because older edit
+        // forms send them back unchanged.
+        const updates = pickEventFields(req.body, { superadmin: isSuperAdmin, includePayment: isSuperAdmin });
         let assignedAdminIdsInput;
 
-        // Payment settings are fixed when the event is created; afterwards only a
-        // superadmin may change them. Dropped (not rejected) for everyone else,
-        // because the edit form always sends them back unchanged.
-        if (req.user?.role !== 'superadmin') {
-            PAYMENT_SETTING_FIELDS.forEach((field) => delete updates[field]);
-        } else if (updates.hasOwnProperty('payment_gateway') || updates.hasOwnProperty('payment_qr_image')) {
+        if (isSuperAdmin && (updates.hasOwnProperty('payment_gateway') || updates.hasOwnProperty('payment_qr_image'))) {
             if (updates.hasOwnProperty('payment_gateway') && !PAYMENT_GATEWAYS.includes(updates.payment_gateway)) {
                 return res.status(400).json({ message: "Payment method must be manual, razorpay or both" });
             }
@@ -484,6 +514,10 @@ export const updateEvent = async (req, res) => {
 
         // document_file is already handled above (uploaded and converted to document_url, then deleted)
         delete updates.data; // Also remove potential junk
+
+        if (Object.keys(updates).length === 0) {
+            return res.status(400).json({ message: "Nothing in this request can be changed by you" });
+        }
 
         const { data, error } = await supabaseAdmin.from('events').update(updates).eq('id', id).select().single();
         if (error) throw error;
