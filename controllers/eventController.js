@@ -2,6 +2,7 @@ import QRCode from 'qrcode';
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { cacheGet, cacheSet, cacheDel } from "../config/redisClient.js";
 import { getPublicEventId, resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
+import { PAYMENT_GATEWAYS, PAYMENT_SETTING_FIELDS, acceptsManual, normalizePaymentGateway } from "../utils/paymentGateway.js";
 import { isCategoryDeadlinePassed } from "../utils/registrationWindow.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 
@@ -278,9 +279,21 @@ export const createEvent = async (req, res) => {
             sponsors,
             assigned_admin_ids,
             assigned_to,
+            // Pulled out of `rest` so the raw data: URL cannot overwrite the
+            // uploaded file's URL when `...rest` is spread into the insert.
+            payment_qr_image: paymentQrInput,
+            payment_gateway: paymentGatewayInput,
             ...rest
         } = req.body;
         if (!name || !sport || !start_date) return res.status(400).json({ message: "Missing required fields" });
+
+        const payment_gateway = paymentGatewayInput ?? "manual";
+        if (!PAYMENT_GATEWAYS.includes(payment_gateway)) {
+            return res.status(400).json({ message: "Payment method must be manual, razorpay or both" });
+        }
+        if (acceptsManual(payment_gateway) && !paymentQrInput) {
+            return res.status(400).json({ message: "A payment QR image is required when QR payment is enabled" });
+        }
 
         const created_by = req.user.id;
         const normalizedAssignedAdminIds = Array.isArray(assigned_admin_ids)
@@ -293,7 +306,7 @@ export const createEvent = async (req, res) => {
         const uploadedDocUrl = (document_file && document_file.startsWith('data:'))
             ? await uploadBase64(document_file, 'event-documents', 'docs')
             : (document_url || null);
-        const payment_qr_image = await uploadBase64(req.body.payment_qr_image, 'event-assets', 'payment-qrs');
+        const payment_qr_image = await uploadBase64(paymentQrInput, 'event-assets', 'payment-qrs');
 
         let processedSponsors = [];
         if (sponsors && Array.isArray(sponsors)) {
@@ -309,7 +322,7 @@ export const createEvent = async (req, res) => {
 
         const { data, error } = await supabaseAdmin.from('events').insert({
             name, sport, start_date, created_by,
-            banner_url, document_url: uploadedDocUrl, payment_qr_image,
+            banner_url, document_url: uploadedDocUrl, payment_qr_image, payment_gateway,
             sponsors: processedSponsors,
             status: 'upcoming',
             assigned_to: primaryAssignedAdminId,
@@ -396,6 +409,27 @@ export const updateEvent = async (req, res) => {
         const { id } = req.params;
         const updates = req.body;
         let assignedAdminIdsInput;
+
+        // Payment settings are fixed when the event is created; afterwards only a
+        // superadmin may change them. Dropped (not rejected) for everyone else,
+        // because the edit form always sends them back unchanged.
+        if (req.user?.role !== 'superadmin') {
+            PAYMENT_SETTING_FIELDS.forEach((field) => delete updates[field]);
+        } else if (updates.hasOwnProperty('payment_gateway') || updates.hasOwnProperty('payment_qr_image')) {
+            if (updates.hasOwnProperty('payment_gateway') && !PAYMENT_GATEWAYS.includes(updates.payment_gateway)) {
+                return res.status(400).json({ message: "Payment method must be manual, razorpay or both" });
+            }
+            const { data: current, error: currentError } = await supabaseAdmin
+                .from('events').select('payment_gateway, payment_qr_image').eq('id', id).maybeSingle();
+            if (currentError) throw currentError;
+            const nextGateway = normalizePaymentGateway(
+                updates.hasOwnProperty('payment_gateway') ? updates.payment_gateway : current?.payment_gateway
+            );
+            const nextQr = updates.hasOwnProperty('payment_qr_image') ? updates.payment_qr_image : current?.payment_qr_image;
+            if (acceptsManual(nextGateway) && !nextQr) {
+                return res.status(400).json({ message: "A payment QR image is required when QR payment is enabled" });
+            }
+        }
 
         if (updates.banner_image) {
             updates.banner_url = await uploadBase64(updates.banner_image, 'event-assets', 'banners');
