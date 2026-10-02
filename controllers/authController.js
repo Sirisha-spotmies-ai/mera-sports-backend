@@ -642,13 +642,16 @@ export const registerPlayer = async (req, res) => {
         // 7. Insert School Details
         if (schoolDetails) {
             try {
-                await supabaseAdmin.from("player_school_details").insert({
+                // supabase-js reports failures through `error`, not by throwing —
+                // without this check a failed insert was silently lost.
+                const { error: schoolError } = await supabaseAdmin.from("player_school_details").insert({
                     player_id: user.id,
                     school_name: schoolDetails.name,
                     school_address: schoolDetails.address,
                     school_city: schoolDetails.city,
                     school_pincode: schoolDetails.pincode,
                 });
+                if (schoolError) console.error("School Details Error:", schoolError);
             } catch (schoolEx) { console.error("School Details Error:", schoolEx); }
         }
 
