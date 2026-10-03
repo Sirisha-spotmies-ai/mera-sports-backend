@@ -7,7 +7,8 @@ import { resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/e
 import { sendRegistrationEmail } from "../utils/mailer.js";
 import { publishReceiptPdf } from "../utils/receiptDelivery.js";
 import { generateReceiptPdf, receiptFilename } from "../utils/receiptPdf.js";
-import { sendRegistrationReceiptWhatsApp } from "../utils/whatsapp.js";
+import { sendRegistrationReceiptWhatsApp, sendRegistrationWhatsApp } from "../utils/whatsapp.js";
+import { isReceiptEligible } from "../utils/approvalNotifications.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 import { acceptsManual, acceptsRazorpay } from "../utils/paymentGateway.js";
 
@@ -309,13 +310,19 @@ const dispatchRegistrationSideEffects = ({ userId, eventId, registrationNo, amou
                 paymentId, paymentMode,
             };
 
+            // Payments awaiting admin approval get a "pending" notice only — the
+            // receipt is sent by notifyRegistrationApproved once it is verified.
+            const awaitingApproval = !isReceiptEligible(status);
+
             // The email builds its own PDF; WhatsApp needs one Meta can fetch.
-            const receipt = user?.mobile ? await publishReceiptPdf(details) : null;
+            const receipt = (user?.mobile && !awaitingApproval) ? await publishReceiptPdf(details) : null;
 
             await Promise.allSettled([
                 user?.email ? sendRegistrationEmail(user.email, details) : Promise.resolve(),
                 user?.mobile
-                    ? sendRegistrationReceiptWhatsApp(user.mobile, details, receipt || {})
+                    ? (awaitingApproval
+                        ? sendRegistrationWhatsApp(user.mobile, details)
+                        : sendRegistrationReceiptWhatsApp(user.mobile, details, receipt || {}))
                     : Promise.resolve(),
             ]);
         } catch (e) { console.error("Email/WhatsApp Error:", e); }
@@ -949,6 +956,40 @@ const RECEIPT_STATUS_LABELS = {
 };
 
 /**
+ * GET /api/payment/registration-status/:registrationNo
+ *
+ * Lightweight owner-only status lookup so the success screen can flip from
+ * "Pending Verification" to "Approved" without a reload.
+ */
+export const getRegistrationStatus = async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+
+        const { data: registration, error } = await supabaseAdmin
+            .from("event_registrations")
+            .select("registration_no, player_id, status, screenshot_url")
+            .eq("registration_no", req.params.registrationNo)
+            .maybeSingle();
+        if (error) throw error;
+        if (!registration || registration.player_id !== userId) {
+            return res.status(404).json({ message: "Registration not found" });
+        }
+
+        res.json({
+            success: true,
+            status: registration.status,
+            label: RECEIPT_STATUS_LABELS[registration.status] || registration.status,
+            receiptReady: isReceiptEligible(registration.status),
+            screenshotUrl: registration.screenshot_url || null,
+        });
+    } catch (err) {
+        console.error("Registration status error:", err);
+        res.status(500).json({ message: "Could not fetch status" });
+    }
+};
+
+/**
  * GET /api/payment/receipt/:registrationNo
  *
  * Serves the same PDF the confirmation email attaches and WhatsApp delivers, so
@@ -977,6 +1018,15 @@ export const downloadRegistrationReceipt = async (req, res) => {
         // make them enumerable.
         if (!registration || registration.player_id !== userId) {
             return res.status(404).json({ message: "Receipt not found" });
+        }
+
+        // The receipt is released only after admin approval.
+        if (!isReceiptEligible(registration.status)) {
+            return res.status(403).json({
+                message: "Receipt will be available once your registration is approved",
+                code: "RECEIPT_NOT_READY",
+                status: registration.status,
+            });
         }
 
         const [{ data: user }, { data: event }, { data: transaction }] = await Promise.all([
