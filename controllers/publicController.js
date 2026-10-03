@@ -239,6 +239,9 @@ ${body}
 // GET /api/public/settings
 export const getPublicSettings = async (req, res) => {
     try {
+        // The server keeps its own short cache (busted on admin save); stop
+        // browsers/proxies from layering another one on top of it.
+        res.set("Cache-Control", "no-store");
         // Cache-aside: settings change rarely — cache for 2 min.
         const cached = await cacheGet("public:settings");
         if (cached) return res.json({ success: true, settings: cached });
