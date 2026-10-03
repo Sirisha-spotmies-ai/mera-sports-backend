@@ -4,6 +4,7 @@ import { createNotification } from "../services/notificationService.js";
 import { invalidateDashboardForRegistration } from "../utils/dashboardCache.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 import { sendRegistrationStatusWhatsApp } from "../utils/whatsapp.js";
+import { notifyRegistrationApproved } from "../utils/approvalNotifications.js";
 import { invalidateMatchesCache } from "../utils/matchesCache.js";
 import { getManageableEventIds } from "../middleware/eventAccess.js";
 
@@ -235,7 +236,8 @@ export const verifyTransaction = async (req, res) => {
                 `Your registration for ${updatedReg.events?.name} (Reg No: ${updatedReg.registration_no}) has been verified.`,
                 "success"
             );
-            notifyRegistrationStatusWhatsApp(updatedReg.player_id, updatedReg.events?.name, updatedReg.registration_no, "Verified");
+            // Approval is what releases the receipt: email + WhatsApp with the PDF.
+            notifyRegistrationApproved(id);
         }
         res.json({ success: true, message: "Transaction verified" });
     } catch (err) {
@@ -319,7 +321,8 @@ export const bulkUpdateTransactions = async (req, res) => {
                 const type = status === 'verified' ? "success" : "error";
                 const msg = `Your registration for ${reg.events?.name} (Reg No: ${reg.registration_no}) was ${status}.`;
                 createNotification(reg.player_id, title, msg, type);
-                notifyRegistrationStatusWhatsApp(reg.player_id, reg.events?.name, reg.registration_no, statusLabel);
+                if (status === 'verified') notifyRegistrationApproved(reg.id);
+                else notifyRegistrationStatusWhatsApp(reg.player_id, reg.events?.name, reg.registration_no, statusLabel);
             });
         }
         res.json({ success: true, message: `Transactions ${status}`, count, skipped });
