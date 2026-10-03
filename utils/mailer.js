@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import { Resend } from 'resend';
 import { generateReceiptPdf, receiptFilename } from './receiptPdf.js';
+import { formatDateIST } from './dateFormat.js';
 
 dotenv.config({ quiet: true });
 
@@ -46,7 +47,7 @@ export const sendRegistrationEmail = async (toEmail, details) => {
                     <p style="margin: 5px 0;"><strong>Event:</strong> ${eventName}</p>
                     <p style="margin: 5px 0;"><strong>Categories:</strong> ${categoriesText}</p>
                     <p style="margin: 5px 0;"><strong>Amount Paid:</strong> ₹${amount}</p>
-                    <p style="margin: 5px 0;"><strong>Date:</strong> ${new Date(date).toLocaleDateString()}</p>
+                    <p style="margin: 5px 0;"><strong>Date:</strong> ${formatDateIST(date)}</p>
                     <p style="margin: 5px 0;"><strong>Status:</strong> <span style="text-transform: uppercase;">${details.status || 'Verified'}</span></p>
                 </div>
 
