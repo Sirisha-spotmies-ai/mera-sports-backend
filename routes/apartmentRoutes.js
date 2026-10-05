@@ -1,3 +1,4 @@
+import { cacheRoute } from "../middleware/responseCache.js";
 import express from "express";
 import { addApartment, deleteApartment, getApartments, migrateApartments, updateApartment } from "../controllers/apartmentController.js";
 import { authenticateUser } from "../middleware/authMiddleware.js";
@@ -13,7 +14,7 @@ const router = express.Router();
 const canManageApartments = [verifyAdmin, requirePermission("apartments")];
 
 router.post("/migrate", verifyAdmin, requireSuperAdmin, migrateApartments);
-router.get("/", getApartments);
+router.get("/", cacheRoute("apartments", 300), getApartments);
 router.post("/", authenticateUser, requirePermission("apartments"), addApartment);
 router.put("/:id", canManageApartments, updateApartment);
 router.delete("/:id", canManageApartments, deleteApartment);
