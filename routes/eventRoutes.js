@@ -1,3 +1,4 @@
+import { cacheRoute } from "../middleware/responseCache.js";
 import express from "express";
 import {
     createEvent,
@@ -19,11 +20,11 @@ const eventAccess = requireEventAccess(fromParam("id"));
 const router = express.Router();
 
 router.post('/create', verifyAdmin, createEvent);
-router.get('/list', listEvents);
+router.get('/list', cacheRoute('events-list', 20), listEvents);
 router.get('/:id', getEventDetails);
-router.get('/:id/brackets', getEventBrackets);
+router.get('/:id/brackets', cacheRoute('brackets', 60), getEventBrackets);
 router.get('/:id/matches', getPublicMatches); // Public scoreboard endpoint
-router.get('/:id/sponsors', getEventSponsors);
+router.get('/:id/sponsors', cacheRoute('sponsors', 60), getEventSponsors);
 router.patch('/:id/categories/:categoryId/registration', verifyAdmin, eventAccess, setCategoryRegistrationStatus);
 router.put('/:id', verifyAdmin, eventAccess, updateEvent);
 router.delete('/:id', verifyAdmin, eventAccess, deleteEvent);
