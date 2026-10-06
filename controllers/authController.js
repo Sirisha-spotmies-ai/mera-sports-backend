@@ -34,7 +34,7 @@ import { uploadBase64 } from "../utils/uploadHelper.js";
  */
 export const sendForgotPasswordOtp = async (req, res) => {
     try {
-        const { method, value } = req.body;
+        const { method, value, userId } = req.body;
         if (!method || !value) {
             return res.status(400).json({ success: false, message: "Method and value are required" });
         }
@@ -50,10 +50,30 @@ export const sendForgotPasswordOtp = async (req, res) => {
             // can legitimately match several rows. .maybeSingle() errors on >1 row,
             // which surfaced as "No account is registered". resetPassword picks the
             // parent account out of the same set.
-            const { data: mobileUsers, error: lookupError } = await supabaseAdmin.from("users").select("id").eq("mobile", bareMobile).limit(1);
+            const { data: mobileUsers, error: lookupError } = await supabaseAdmin.from("users").select("*").eq("mobile", bareMobile).eq("role", "player");
             if (lookupError) throw lookupError;
             if (!mobileUsers || mobileUsers.length === 0) {
                 return res.status(404).json({ success: false, message: "No account is registered with this mobile number." });
+            }
+
+            // Shared number: ask which account BEFORE spending an OTP. Nothing is
+            // verified yet, so the list is deliberately minimal (name, relation,
+            // age) - no player id, photo or contact details.
+            if (mobileUsers.length > 1) {
+                if (!userId) {
+                    const profiles = await withFamilyRelations(mobileUsers);
+                    return res.json({
+                        success: true,
+                        requiresAccountSelection: true,
+                        profiles: profiles.map(p => {
+                            const summary = toProfileSummary(p);
+                            return { id: p.id, name: summary.name, age: summary.age, relation: p.__relation };
+                        }),
+                    });
+                }
+                if (!mobileUsers.some(u => u.id === userId)) {
+                    return res.status(400).json({ success: false, message: "That account does not use this mobile number." });
+                }
             }
 
             const result = await sendMobileOtp(value);
@@ -81,9 +101,21 @@ export const sendForgotPasswordOtp = async (req, res) => {
 // Verifies a forgot-password OTP and issues a short-lived reset token.
 // This is what binds the reset to a proven OTP — resetPassword below refuses
 // to run without a valid token, so the reset can never be called directly.
+// Labels each account on a shared number as Head or by its family relation, adults first.
+const withFamilyRelations = async (users) => {
+    const { data: rels } = await supabaseAdmin
+        .from("family_relations")
+        .select("of_player_id, relation")
+        .in("of_player_id", users.map(u => u.id));
+    const relById = new Map((rels || []).map(r => [r.of_player_id, r.relation]));
+    return users
+        .map(u => ({ ...u, __relation: relById.get(u.id) || 'Head' }))
+        .sort((x, y) => (resolveAge(y) ?? 0) - (resolveAge(x) ?? 0));
+};
+
 export const verifyForgotPasswordOtp = async (req, res) => {
     try {
-        const { method, value, otp, sessionId } = req.body;
+        const { method, value, otp, sessionId, userId } = req.body;
         if (!method || !value || !otp) {
             return res.status(400).json({ message: "Missing verification data" });
         }
@@ -102,14 +134,40 @@ export const verifyForgotPasswordOtp = async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid OTP or session expired" });
         }
 
+        // A mobile number can belong to several accounts (a parent and their
+        // children). The OTP only proves control of the number, so the person
+        // then chooses which account to reset; the token pins the allowed set so
+        // resetPassword cannot be pointed at an unrelated user id.
+        let profiles = [];
+        if (method === 'mobile') {
+            const normalized = normalizeWhatsAppNumber(value);
+            const bareMobile = normalized ? normalized.slice(2) : String(value).trim();
+            const { data: sharing, error: sharingError } = await supabaseAdmin
+                .from("users")
+                .select("*")
+                .eq("mobile", bareMobile)
+                .eq("role", "player");
+            if (sharingError) throw sharingError;
+            if ((sharing || []).length > 1) {
+                const preChosen = userId && sharing.find(u => u.id === userId);
+                // Already chosen before the OTP was sent: pin the token to that
+                // account only. Otherwise fall back to choosing after verification.
+                profiles = preChosen ? [preChosen] : await withFamilyRelations(sharing);
+            }
+        }
+
         // Reset token is bound to this exact method+value and expires in 10 minutes
         const resetToken = jwt.sign(
-            { type: 'password_reset', method, value },
+            { type: 'password_reset', method, value, ...(profiles.length > 0 ? { ids: profiles.map(p => p.id) } : {}) },
             process.env.JWT_SECRET,
             { expiresIn: "10m" }
         );
 
-        res.json({ success: true, resetToken });
+        res.json({
+            success: true,
+            resetToken,
+            ...(profiles.length > 1 ? { requiresAccountSelection: true, profiles: profiles.map(toProfileSummary) } : {}),
+        });
     } catch (err) {
         console.error("FORGOT PASSWORD VERIFY OTP ERROR:", err.message);
         res.status(500).json({ success: false, message: "Verification failed" });
@@ -189,7 +247,7 @@ export const sendInstituteForgotPasswordOtp = async (req, res) => {
 
 export const resetPassword = async (req, res) => {
     try {
-        const { method, value, newPassword, resetToken } = req.body;
+        const { method, value, newPassword, resetToken, userId } = req.body;
         if (!method || !value || !newPassword || !resetToken) {
             return res.status(400).json({ message: "Missing reset data" });
         }
@@ -223,7 +281,19 @@ export const resetPassword = async (req, res) => {
             const normalized = normalizeWhatsAppNumber(value);
             const bareMobile = normalized ? normalized.slice(2) : value;
 
+            // Shared number: the user chose an account after the OTP step, and the
+            // token lists which ones were on offer.
+            if (Array.isArray(decoded.ids) && decoded.ids.length > 0) {
+                if (!userId || !decoded.ids.includes(userId)) {
+                    return res.status(400).json({ message: "Please choose which account to reset." });
+                }
+                const { data: chosen } = await supabaseAdmin.from("users").select("id").eq("id", userId).maybeSingle();
+                if (!chosen) return res.status(404).json({ message: "User not found" });
+                user = chosen;
+            }
+
             const { data: mobileUsers } = await supabaseAdmin.from("users").select("id").eq('mobile', bareMobile);
+            if (!user) {
             if (!mobileUsers || mobileUsers.length === 0) return res.status(404).json({ message: "User not found" });
 
             const { data: familyRels } = await supabaseAdmin
@@ -233,6 +303,7 @@ export const resetPassword = async (req, res) => {
 
             const familyMemberIds = new Set((familyRels || []).map(r => r.of_player_id));
             user = mobileUsers.find(u => !familyMemberIds.has(u.id)) || mobileUsers[0];
+            }
 
         } else if (method === 'email') {
             const { data } = await supabaseAdmin.from("users").select("id").eq('email', value).maybeSingle();
