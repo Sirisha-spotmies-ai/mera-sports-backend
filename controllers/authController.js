@@ -46,8 +46,13 @@ export const sendForgotPasswordOtp = async (req, res) => {
             const normalized = normalizeWhatsAppNumber(value);
             const bareMobile = normalized ? normalized.slice(2) : String(value).trim();
 
-            const { data: user } = await supabaseAdmin.from("users").select("id").eq("mobile", bareMobile).maybeSingle();
-            if (!user) {
+            // Family accounts share one mobile number (parent + children), so this
+            // can legitimately match several rows. .maybeSingle() errors on >1 row,
+            // which surfaced as "No account is registered". resetPassword picks the
+            // parent account out of the same set.
+            const { data: mobileUsers, error: lookupError } = await supabaseAdmin.from("users").select("id").eq("mobile", bareMobile).limit(1);
+            if (lookupError) throw lookupError;
+            if (!mobileUsers || mobileUsers.length === 0) {
                 return res.status(404).json({ success: false, message: "No account is registered with this mobile number." });
             }
 
@@ -1239,7 +1244,7 @@ export const getCurrentUser = async (req, res) => {
         if (!token) return res.status(401).json({ message: "No token provided" }); // Double check
 
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const { data: user, error } = await supabaseAdmin.from("users").select("id, name, email, role, photos, verification, last_login, previous_login").eq("id", decoded.id).maybeSingle();
+        const { data: user, error } = await supabaseAdmin.from("users").select("id, name, email, role, photos, verification, last_login, previous_login, created_at").eq("id", decoded.id).maybeSingle();
 
         // A database failure is NOT "this user does not exist". Returning 404
         // here told the admin client the account was gone, so it wiped the
@@ -1262,7 +1267,8 @@ export const getCurrentUser = async (req, res) => {
                 avatar: user.photos,
                 verification: user.verification,
                 last_login: user.last_login,
-                previous_login: user.previous_login
+                previous_login: user.previous_login,
+                created_at: user.created_at
             }
         });
     } catch (err) {
