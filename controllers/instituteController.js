@@ -663,7 +663,7 @@ export const finalizeBulkImport = async (req, res) => {
                 last_name: student.last_name,
                 email: student.email,
                 mobile: student.mobile,
-                aadhaar: student.aadhaar ? `***${String(student.aadhaar).slice(-4)}` : null,
+                aadhaar: student.aadhaar ? `••••••••${String(student.aadhaar).slice(-4)}` : null,
                 dob: student.dob,
                 gender: student.gender,
                 institute_name: student.institute_name,
