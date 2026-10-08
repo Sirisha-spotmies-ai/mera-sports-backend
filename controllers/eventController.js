@@ -6,6 +6,7 @@ import { PAYMENT_GATEWAYS, PAYMENT_SETTING_FIELDS, acceptsManual, normalizePayme
 import { invalidateEventAccessCache } from "../middleware/eventAccess.js";
 import { isCategoryDeadlinePassed } from "../utils/registrationWindow.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
+import { loadCommunities, normalizeCommunityIds, normalizeInstituteNames, normalizeRestrictionMessage, resolveCommunityNames, validateCommunityIds } from "../utils/communityRestriction.js";
 
 /**
  * Invalidate all event-related caches. Call after any event write so public
@@ -61,6 +62,11 @@ const EVENT_EDITABLE_FIELDS = [
     "banner_image", "document_file", "document_url", "document_description", "is_document_required",
     "rules_and_regulations", "sponsors", "categories", "pincode", "state", "city",
     "google_map_link", "show_slots", "event_format_type",
+    // allowed_community_names is input-only: new group names the admin typed,
+    // turned into apartments ids below and never written to events.
+    "community_restrictions_enabled", "allowed_community_ids", "allowed_community_names", "allowed_institute_names", "community_restriction_message",
+    // Organiser's note shown to players in a pop-up while they register.
+    "registration_message",
 ];
 // Who runs an event and its lifecycle status are the superadmin's call.
 const SUPERADMIN_ONLY_EVENT_FIELDS = ["assigned_admin_ids", "assigned_to", "status"];
@@ -76,6 +82,53 @@ const pickEventFields = (body, { superadmin, includePayment }) => {
         if (Object.prototype.hasOwnProperty.call(body || {}, field)) picked[field] = body[field];
     }
     return picked;
+};
+
+// Normalises community-restriction fields in-place on `fields` (a picked create
+// or update payload). Returns an error message to send as a 400, or null.
+// `current` is the stored event, needed on update when only one of the two
+// fields was sent. Turning the restriction off also clears the list, so the
+// event is open to everyone again and no stale ids linger.
+const applyCommunityRestriction = async (fields, current = null) => {
+    const has = (key) => Object.prototype.hasOwnProperty.call(fields, key);
+    const hasEnabled = has("community_restrictions_enabled");
+    const hasIds = has("allowed_community_ids");
+    const hasNames = has("allowed_community_names");
+    const hasMessage = has("community_restriction_message");
+    const hasInstitutes = has("allowed_institute_names");
+    // The player-facing message stands on its own: it is saved whether or not an
+    // allow-list restriction is on.
+    if (hasMessage) fields.community_restriction_message = normalizeRestrictionMessage(fields.community_restriction_message);
+    if (!hasEnabled && !hasIds && !hasNames && !hasInstitutes) return null;
+
+    const enabled = hasEnabled
+        ? fields.community_restrictions_enabled === true
+        : current?.community_restrictions_enabled === true;
+    const newNames = hasNames ? fields.allowed_community_names : [];
+    delete fields.allowed_community_names;
+
+    if (!enabled) {
+        fields.community_restrictions_enabled = false;
+        fields.allowed_community_ids = [];
+        // allowed_institute_names is only written when the request sent it, so
+        // turning a restriction off never needs that column to exist.
+        return null;
+    }
+
+    const requested = normalizeCommunityIds([
+        ...(hasIds ? (fields.allowed_community_ids || []) : (current?.allowed_community_ids || [])),
+        ...(await resolveCommunityNames(newNames)),
+    ]);
+    // Ids that no longer exist are dropped rather than saved.
+    const { ids } = await validateCommunityIds(requested);
+    const institutes = normalizeInstituteNames(hasInstitutes ? fields.allowed_institute_names : current?.allowed_institute_names);
+    if (ids.length === 0 && institutes.length === 0) {
+        return "Select at least one community or institute, or turn off Community Restrictions";
+    }
+    fields.allowed_institute_names = institutes;
+    fields.community_restrictions_enabled = true;
+    fields.allowed_community_ids = ids;
+    return null;
 };
 
 const loadAssignedAdminsForEvent = async (eventId) => {
@@ -238,6 +291,23 @@ export const getEventDetails = async (req, res) => {
 
         eventData.news = newsData || [];
 
+        // Community restriction: expose ids + names so the admin form can show
+        // the saved selection and the player page can name the communities.
+        // Events from before the feature have neither column — normalise them.
+        eventData.community_restrictions_enabled = eventData.community_restrictions_enabled === true;
+        eventData.allowed_community_ids = normalizeCommunityIds(eventData.allowed_community_ids);
+        eventData.community_restriction_message = eventData.community_restriction_message || null;
+        eventData.registration_message = eventData.registration_message || null;
+        eventData.allowed_institute_names = normalizeInstituteNames(eventData.allowed_institute_names);
+        try {
+            eventData.allowed_communities = eventData.community_restrictions_enabled
+                ? await loadCommunities(eventData.allowed_community_ids)
+                : [];
+        } catch (communityErr) {
+            console.error('loadCommunities error:', communityErr?.message || communityErr);
+            eventData.allowed_communities = [];
+        }
+
         // Stats — team_id lets team/doubles categories count distinct teams, not
         // individual players. (Singles: team_id null → count rows. Team/Doubles:
         // team_id shared → count distinct team_ids.) regStats fetched in the batch above.
@@ -349,6 +419,13 @@ export const createEvent = async (req, res) => {
             }));
         }
 
+        const pickedFields = pickEventFields(rest, { superadmin: isSuperAdmin, includePayment: true });
+        if (Object.prototype.hasOwnProperty.call(pickedFields, "registration_message")) {
+            pickedFields.registration_message = normalizeRestrictionMessage(pickedFields.registration_message);
+        }
+        const communityError = await applyCommunityRestriction(pickedFields);
+        if (communityError) return res.status(400).json({ message: communityError });
+
         const { data, error } = await supabaseAdmin.from('events').insert({
             name, sport, start_date, created_by,
             banner_url, document_url: uploadedDocUrl, payment_qr_image, payment_gateway,
@@ -357,7 +434,7 @@ export const createEvent = async (req, res) => {
             assigned_to: primaryAssignedAdminId,
             assigned_by: primaryAssignedAdminId ? created_by : null,
             // upi_id rides in here: payment settings are open at creation.
-            ...pickEventFields(rest, { superadmin: isSuperAdmin, includePayment: true })
+            ...pickedFields
         }).select().single();
 
         if (error) throw error;
@@ -444,6 +521,18 @@ export const updateEvent = async (req, res) => {
         // forms send them back unchanged.
         const updates = pickEventFields(req.body, { superadmin: isSuperAdmin, includePayment: isSuperAdmin });
         let assignedAdminIdsInput;
+
+        if (updates.hasOwnProperty('registration_message')) {
+            updates.registration_message = normalizeRestrictionMessage(updates.registration_message);
+        }
+        const touchesCommunity = ['community_restrictions_enabled', 'allowed_community_ids', 'allowed_community_names', 'allowed_institute_names'].some((k) => updates.hasOwnProperty(k));
+        let currentCommunity = null;
+        if (touchesCommunity && !(updates.hasOwnProperty('community_restrictions_enabled') && updates.hasOwnProperty('allowed_community_ids'))) {
+            const { data: cur } = await supabaseAdmin.from('events').select('*').eq('id', id).maybeSingle();
+            currentCommunity = cur;
+        }
+        const communityError = await applyCommunityRestriction(updates, currentCommunity);
+        if (communityError) return res.status(400).json({ message: communityError });
 
         if (isSuperAdmin && (updates.hasOwnProperty('payment_gateway') || updates.hasOwnProperty('payment_qr_image'))) {
             if (updates.hasOwnProperty('payment_gateway') && !PAYMENT_GATEWAYS.includes(updates.payment_gateway)) {

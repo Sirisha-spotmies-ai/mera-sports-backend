@@ -6,6 +6,7 @@ import {
     listAdmins,
     getPendingInstitutes,
     getVerifiedInstitutes,
+    getInstituteNames,
     getPendingStudentImports,
     getApprovedStudentImports,
     approveStudentImport,
@@ -75,6 +76,7 @@ router.get("/list-admins", superOnly, listAdmins);
 router.get("/assignments", superOnly, getAssignments);
 router.get("/institutes/pending", superOnly, getPendingInstitutes);
 router.get("/institutes/verified", superOnly, getVerifiedInstitutes);
+router.get("/institutes/names", verifyAdmin, getInstituteNames);
 router.get("/institutes/imports/pending", superOnly, getPendingStudentImports);
 router.get("/institutes/imports/approved", superOnly, getApprovedStudentImports);
 router.put("/institutes/imports/:id/approve", superOnly, approveStudentImport);

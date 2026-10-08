@@ -261,6 +261,8 @@ export const schemas = {
             document_description: { type: "string", nullable: true },
             is_document_required: { type: "boolean" },
             show_slots: { type: "boolean" },
+            community_restrictions_enabled: { type: "boolean", description: "When true, only players from allowed_community_ids may register" },
+            allowed_community_ids: { type: "array", items: { type: "string" }, description: "Apartment ids allowed to register" },
             payment_method: { type: "string", enum: ["manual", "razorpay"], example: "manual" },
             payment_gateway: { type: "string", enum: ["manual", "razorpay", "both"], example: "manual" },
             payment_qr_image: { type: "string", nullable: true },
@@ -307,6 +309,8 @@ export const schemas = {
             upi_id: { type: "string" },
             is_document_required: { type: "boolean" },
             show_slots: { type: "boolean" },
+            community_restrictions_enabled: { type: "boolean", description: "When true, only players from allowed_community_ids may register" },
+            allowed_community_ids: { type: "array", items: { type: "string" }, description: "Apartment ids allowed to register" },
             status: { type: "string", enum: ["upcoming", "ongoing", "completed", "cancelled"] },
             assigned_admin_ids: {
                 type: "array",

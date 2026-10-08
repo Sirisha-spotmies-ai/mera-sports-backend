@@ -11,6 +11,7 @@ import { sendRegistrationReceiptWhatsApp, sendRegistrationWhatsApp } from "../ut
 import { isReceiptEligible } from "../utils/approvalNotifications.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 import { acceptsManual, acceptsRazorpay } from "../utils/paymentGateway.js";
+import { assertCommunityAllowed } from "../utils/communityRestriction.js";
 
 // These routes accept any signed token, so staff accounts must be turned away
 // explicitly. Listing staff roles (rather than requiring 'player') keeps older
@@ -424,7 +425,9 @@ export const createRazorpayOrder = async (req, res) => {
             return res.status(400).json({ message: "Missing fields: eventId and categories are required" });
         }
 
-        const event = await resolveEventByIdentifier(eventId, "id, categories, payment_gateway");
+        // "*" rather than a column list so this keeps working on a database
+        // that has not had the community-restriction migration applied yet.
+        const event = await resolveEventByIdentifier(eventId, "*");
         if (!event) return res.status(404).json({ message: "Event not found" });
         if (!acceptsRazorpay(event.payment_gateway)) {
             return res.status(400).json({ message: "This event does not accept Razorpay payments" });
@@ -442,8 +445,11 @@ export const createRazorpayOrder = async (req, res) => {
         // is bypassable. Runs before the order is created so an ineligible player
         // is never charged.
         const { data: payingUser } = await supabaseAdmin
-            .from("users").select("gender, dob, age").eq("id", userId).maybeSingle();
+            .from("users").select("gender, dob, age, apartment, institute_name").eq("id", userId).maybeSingle();
         assertPlayerEligible(payingUser, categoryObjects);
+        // Community-restricted events: checked before the order exists, so a
+        // player outside the allowed communities is never charged.
+        await assertCommunityAllowed(event, payingUser);
         if (amount !== undefined && Math.round(Number(amount) * 100) !== Math.round(fee * 100)) {
             return res.status(400).json({ message: "Amount mismatch — please refresh the page and try again" });
         }
@@ -840,7 +846,7 @@ export const submitManualPayment = async (req, res) => {
         if (!eventId || !Array.isArray(categories) || categories.length === 0 || !screenshot) return res.status(400).json({ message: "Missing fields" });
         if (isStaffRole(req.user.role)) return res.status(403).json({ message: "Admins cannot register." });
 
-        const eventForEligibility = await resolveEventByIdentifier(eventId, "id, categories, payment_gateway");
+        const eventForEligibility = await resolveEventByIdentifier(eventId, "*");
         if (!eventForEligibility) return res.status(404).json({ message: "Event not found" });
         const resolvedEventId = eventForEligibility.id;
         if (!acceptsManual(eventForEligibility.payment_gateway)) {
@@ -859,8 +865,9 @@ export const submitManualPayment = async (req, res) => {
             fee = computed.fee;
             const { categoryObjects } = computed;
             const { data: payingUser } = await supabaseAdmin
-                .from("users").select("gender, dob, age").eq("id", userId).maybeSingle();
+                .from("users").select("gender, dob, age, apartment, institute_name").eq("id", userId).maybeSingle();
             assertPlayerEligible(payingUser, categoryObjects);
+            await assertCommunityAllowed(eventForEligibility, payingUser);
         } catch (eligErr) {
             if (eligErr.statusCode === 400) return res.status(400).json({ message: eligErr.message, ...(eligErr.code ? { code: eligErr.code } : {}) });
             throw eligErr;
