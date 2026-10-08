@@ -207,6 +207,29 @@ export const getVerifiedInstitutes = async (req, res) => {
     }
 };
 
+// GET /api/admin/institutes/names
+// Names only, open to any admin: the event form's Community Restrictions picker
+// needs them, and /institutes/verified is super-admin-only and returns contact
+// details an event creator has no business seeing.
+export const getInstituteNames = async (req, res) => {
+    try {
+        const { data, error } = await supabaseAdmin
+            .from("users")
+            .select("institute_name, name")
+            .eq("role", "institutehead")
+            .eq("verification", "verified");
+        if (error) throw error;
+
+        const names = Array.from(new Set(
+            (data || []).map((row) => String(row.institute_name || row.name || "").trim()).filter(Boolean)
+        )).sort((a, b) => a.localeCompare(b));
+        res.json({ success: true, institutes: names });
+    } catch (err) {
+        console.error("FETCH INSTITUTE NAMES ERROR:", err);
+        res.status(500).json({ message: "Failed to fetch institutes" });
+    }
+};
+
 // PUT /api/admin/institutes/:id/approve
 export const approveInstitute = async (req, res) => {
     try {
