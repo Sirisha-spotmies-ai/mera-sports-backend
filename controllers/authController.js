@@ -332,6 +332,21 @@ export const resetPassword = async (req, res) => {
 
 /* ================= SECURITY VERIFICATION (PROFILE UPDATE / PASSWORD CHANGE) ================= */
 
+// Partly hidden address for "OTP sent to ..." copy: ma******@gmail.com / XXXXXX3210.
+const maskOtpDestination = (method, value) => {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    if (method === "email") {
+        const [local, domain] = raw.split("@");
+        if (!domain) return raw;
+        const shown = local.slice(0, Math.min(2, local.length));
+        return `${shown}${"*".repeat(Math.max(local.length - shown.length, 3))}@${domain}`;
+    }
+    const digits = raw.replace(/\D/g, "");
+    if (digits.length <= 4) return digits;
+    return "X".repeat(digits.length - 4) + digits.slice(-4);
+};
+
 export const sendVerificationOtp = async (req, res) => {
     try {
         const authHeader = req.headers.authorization;
@@ -354,7 +369,7 @@ export const sendVerificationOtp = async (req, res) => {
             if (!user.mobile) return res.status(400).json({ message: "No mobile number registered" });
 
             const result = await sendMobileOtp(user.mobile);
-            res.json({ success: true, method: 'mobile', sessionId: result.sessionId });
+            res.json({ success: true, method: 'mobile', sessionId: result.sessionId, sentTo: maskOtpDestination('mobile', user.mobile) });
 
         } else if (method === 'email') {
             if (!user.email) return res.status(400).json({ message: "No email registered" });
@@ -364,7 +379,7 @@ export const sendVerificationOtp = async (req, res) => {
             // but signInWithOtp works for existing users too.
             // Let's use the service but wrap error handling if specialized.
             await sendEmailOtp(user.email);
-            res.json({ success: true, method: 'email' });
+            res.json({ success: true, method: 'email', sentTo: maskOtpDestination('email', user.email) });
         } else {
             res.status(400).json({ message: "Invalid verification method" });
         }
