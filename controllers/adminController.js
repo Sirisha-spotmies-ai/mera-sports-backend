@@ -398,6 +398,12 @@ export const getDashboardStats = async (req, res) => {
             .order("created_at", { ascending: false })
             .limit(5);
 
+        // Payments awaiting review (same statuses the Transactions page treats as pending)
+        const { count: pendingTransactionsCount } = noEvents ? { count: 0 } : await forScope(supabaseAdmin
+            .from("event_registrations")
+            .select("*", { count: 'exact', head: true })
+            .in("status", ["pending_verification", "pending", "payment_pending", "registered"]));
+
         // Revenue
         const { data: approvedTxns } = noEvents ? { data: [] } : await forScope(supabaseAdmin.from("event_registrations").select("amount_paid").eq("status", "verified"));
         const totalRevenue = approvedTxns?.reduce((sum, txn) => sum + (Number(txn.amount_paid) || 0), 0) || 0;
@@ -411,7 +417,8 @@ export const getDashboardStats = async (req, res) => {
                 pendingPlayers: pendingPlayers || 0,
                 rejectedPlayers: rejectedPlayersCount || 0,
                 totalRevenue,
-                totalTransactionsCount
+                totalTransactionsCount,
+                pendingTransactionsCount: pendingTransactionsCount || 0
             },
             recentPlayers: (recentPlayers || []).map(withoutPassword),
             rejectedPlayersList: (rejectedPlayersList || []).map(withoutPassword),
