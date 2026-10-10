@@ -93,7 +93,8 @@ const matchesByName = (entry, target, registration) => {
 
 export const registrationMatchesCategory = (registration, target) =>
     registrationCategories(registration).some((entry) => {
-        const entryId = normalizeId(entry && typeof entry === "object" ? entry.id : entry);
+        // normalizeId reads id, then categoryId / category_id, from an object entry.
+        const entryId = normalizeId(entry);
         if (target.id && entryId) return entryId === target.id;
         return matchesByName(entry, target, registration);
     });

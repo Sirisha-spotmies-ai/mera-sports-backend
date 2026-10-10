@@ -33,17 +33,25 @@ const MAX_TEXT = 500;
 
 export const updateSettings = async (req, res) => {
     try {
-        const { platformName, supportEmail, supportPhone, logoUrl, logoSize } = req.body;
-        const row = {
-            id: 1,
-            platform_name: platformName,
-            support_email: supportEmail,
-            support_phone: supportPhone,
-            logo_url: logoUrl,
-            logo_size: logoSize,
-            registration_config: req.body.registrationConfig,
-            updated_at: new Date()
+        // Only fields present in the body are written, so a partial save (the
+        // Players page posts registrationConfig alone) never touches the rest.
+        // This used to rely on JSON.stringify silently dropping `undefined`.
+        const row = { id: 1, updated_at: new Date() };
+        const DIRECT_FIELDS = {
+            platformName: "platform_name",
+            supportEmail: "support_email",
+            supportPhone: "support_phone",
+            logoUrl: "logo_url",
+            logoSize: "logo_size",
+            registrationConfig: "registration_config",
         };
+        for (const [key, column] of Object.entries(DIRECT_FIELDS)) {
+            if (req.body[key] !== undefined) row[column] = req.body[key];
+        }
+        // The logo is rendered as <img src> on both apps — web links only.
+        if (row.logo_url && !/^https?:\/\/[^\s]+$/i.test(String(row.logo_url))) {
+            return res.status(400).json({ success: false, message: "logoUrl must be a valid http(s) link" });
+        }
 
         for (const [key, column] of Object.entries(TEXT_FIELDS)) {
             if (req.body[key] === undefined) continue;
