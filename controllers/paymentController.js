@@ -324,6 +324,50 @@ const validateRequestForUser = async (event, userId, body) => {
     return result;
 };
 
+// POST /api/payment/check-teams  { eventId, categoryId }
+// Which of the player's saved teams can be entered in this category, and why
+// not for the rest — the full registration rules (each member's age/gender,
+// pair/team size, nobody already entered in the category), run per team. Feeds
+// the partner/team chooser so an ineligible saved team is greyed out with the
+// reason before it is picked, not after Continue.
+export const checkTeamsForCategory = async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+        if (isStaffRole(req.user.role)) return res.status(403).json({ message: "Admins cannot register." });
+        const { eventId, categoryId } = req.body || {};
+        if (!eventId || !categoryId) return res.status(400).json({ message: "eventId and categoryId are required" });
+
+        const event = await resolveEventByIdentifier(eventId, "*");
+        if (!event) return res.status(404).json({ message: "Event not found" });
+
+        const [{ data: payingUser }, { data: teams, error: teamsErr }] = await Promise.all([
+            supabaseAdmin.from("users").select("gender, dob, age").eq("id", userId).maybeSingle(),
+            supabaseAdmin.from("player_teams").select("id").eq("captain_id", userId)
+                .or("status.is.null,status.neq.deleted"),
+        ]);
+        if (teamsErr) throw teamsErr;
+
+        const results = [];
+        for (const team of teams || []) {
+            try {
+                await validateRegistrationEntries({
+                    event, userId, payingUser,
+                    entries: [{ categoryId: String(categoryId), teamId: team.id }],
+                });
+                results.push({ teamId: team.id, eligible: true });
+            } catch (err) {
+                if (err.statusCode !== 400) throw err;
+                results.push({ teamId: team.id, eligible: false, reason: err.message, code: err.code || null });
+            }
+        }
+        res.json({ success: true, teams: results });
+    } catch (err) {
+        console.error("Check Teams Error:", err);
+        res.status(500).json({ message: "Could not check your teams" });
+    }
+};
+
 // POST /api/payment/validate-registration
 // Dry run of the checks order creation and manual payment will apply. The
 // player app calls it on "Continue", which matters most for QR payments: there

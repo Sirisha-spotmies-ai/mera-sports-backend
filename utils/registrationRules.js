@@ -454,7 +454,7 @@ export const validateRegistrationEntries = async ({ event, userId, payingUser, e
     if (teamIds.length > 0) {
         const { data: teams, error } = await supabaseAdmin
             .from("player_teams")
-            .select("id, team_name, captain_id, captain_name, members")
+            .select("id, team_name, captain_id, captain_name, members, status")
             .in("id", teamIds);
         if (error) throw error;
         for (const t of teams || []) teamsById.set(String(t.id), t);
@@ -496,7 +496,7 @@ export const validateRegistrationEntries = async ({ event, userId, payingUser, e
         if (!r.teamId) continue;
         const extra = { categoryId: String(r.cat.id) };
         const team = teamsById.get(String(r.teamId));
-        if (!team) throw badRequest(`The team chosen for "${categoryLabel(r.cat)}" no longer exists`, "TEAM_NOT_FOUND", extra);
+        if (!team || team.status === "deleted") throw badRequest(`The team chosen for "${categoryLabel(r.cat)}" no longer exists`, "TEAM_NOT_FOUND", extra);
         if (String(team.captain_id) !== String(userId)) {
             throw badRequest(
                 `Only the captain can register "${team.team_name}". Ask ${team.captain_name || "your captain"} to register the team.`,
