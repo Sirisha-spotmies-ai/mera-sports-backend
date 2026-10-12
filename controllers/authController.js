@@ -562,7 +562,7 @@ export const registerPlayer = async (req, res) => {
     try {
         const {
             firstName, lastName, mobile, email, dob,
-            apartment, street, city, state, pincode, country,
+            apartment, street, buildingAddress, city, state, pincode, country,
             aadhaar, schoolDetails, photos, isVerified, gender
         } = req.body;
 
@@ -705,7 +705,12 @@ export const registerPlayer = async (req, res) => {
                 password: password,
                 role: 'player',
                 verification: isVerified ? 'verified' : 'pending',
-                gender: gender || null
+                gender: gender || null,
+                // Only sent when filled in, so registration keeps working on a
+                // database that has not yet run the building_address migration.
+                ...(typeof buildingAddress === "string" && buildingAddress.trim()
+                    ? { building_address: buildingAddress.trim().slice(0, 150) }
+                    : {})
             })
             .select()
             .maybeSingle();
