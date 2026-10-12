@@ -573,6 +573,7 @@ export const schemas = {
                 properties: {
                     showSchool: { type: "boolean" },
                     showStreet: { type: "boolean" },
+                    showBuilding: { type: "boolean" },
                     showApartment: { type: "boolean" },
                 },
                 additionalProperties: true,
