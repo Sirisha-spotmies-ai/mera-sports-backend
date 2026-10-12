@@ -7,6 +7,7 @@ import { sendRegistrationStatusWhatsApp } from "../utils/whatsapp.js";
 import { notifyRegistrationApproved } from "../utils/approvalNotifications.js";
 import { invalidateMatchesCache } from "../utils/matchesCache.js";
 import { getManageableEventIds } from "../middleware/eventAccess.js";
+import { tallyRegistrationEntries } from "../utils/registrationRules.js";
 
 // Fire-and-forget WhatsApp status update to the registration's player
 const notifyRegistrationStatusWhatsApp = (playerId, eventName, registrationNo, status) => {
@@ -131,47 +132,224 @@ const attachMemberPlayerCodes = async (registrations) => {
 const resolveScopedAdminId = (req) =>
     req.user?.role === 'superadmin' ? (req.query.admin_id || null) : req.user?.id;
 
-export const getRegistrations = async (req, res) => {
-    try {
-        const { eventId, page, limit } = req.query;
-        let query = supabaseAdmin.from("event_registrations")
-            .select(`
+const REGISTRATION_LIST_FIELDS = `
                 id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories, document_url,
                 events ( id, name, sport, start_date, end_date, start_time, location, venue, categories, status ),
                 users:player_id ( id, first_name, last_name, player_id, mobile, email, gender, apartment ),
                 player_teams ( id, team_name, captain_name, captain_mobile, members )
-            `, { count: 'exact' })
-            .order('created_at', { ascending: false });
+            `;
 
-        if (eventId) query = query.eq('event_id', eventId);
+/** Statuses the "Pending" filter covers (same list the admin page always used). */
+const PENDING_FILTER_STATUSES = ['pending', 'payment_pending', 'registered', 'pending_verification', 'Submitted'];
 
+const parseRegistrationCategories = (cats) => {
+    if (!cats) return [];
+    if (typeof cats === "string") {
+        try {
+            const parsed = JSON.parse(cats);
+            return Array.isArray(parsed) ? parsed : [parsed];
+        } catch {
+            return [cats];
+        }
+    }
+    return Array.isArray(cats) ? cats : [cats];
+};
+
+/** "Adults (Male) - Doubles" — the label the admin page shows and filters by. */
+const registrationCategoryLabel = (c) => {
+    if (!c) return "Unknown";
+    if (typeof c === "string") return c;
+    const name = c.name || c.category || c.Category || c.id || "Unknown";
+    const genderPart = c.gender ? ` (${c.gender})` : "";
+    const type = c.matchType || c.match_type || c.type;
+    return `${name}${genderPart}${type ? ` - ${type}` : ""}`;
+};
+
+/**
+ * The page's filters, applied to one row exactly as the admin page used to
+ * apply them in the browser — only now to every row, before paging.
+ */
+const matchesRegistrationFilters = (reg, { search, category, apartment }) => {
+    if (search) {
+        const q = search.toLowerCase();
+        const playerName = `${reg.users?.first_name} ${reg.users?.last_name}`.toLowerCase();
+        const hit = playerName.includes(q)
+            || reg.registration_no?.toLowerCase().includes(q)
+            || reg.events?.name?.toLowerCase().includes(q)
+            || reg.users?.player_id?.toLowerCase().includes(q);
+        if (!hit) return false;
+    }
+    if (category) {
+        const hit = parseRegistrationCategories(reg.categories).some((c) => {
+            const base = (c && typeof c === "object") ? (c.name || c.category || c.Category || c.id) : String(c);
+            return registrationCategoryLabel(c) === category || base === category;
+        });
+        if (!hit) return false;
+    }
+    if (apartment) {
+        if (!reg.users?.apartment || reg.users.apartment.trim() !== apartment.trim()) return false;
+    }
+    return true;
+};
+
+/** Event scope + the filters the database can apply directly (event, status). */
+const applyRegistrationScope = (query, { eventIds, eventId, status }) => {
+    if (eventIds) query = query.in('event_id', eventIds);
+    if (eventId) query = query.eq('event_id', eventId);
+    if (status === 'pending') query = query.in('status', PENDING_FILTER_STATUSES);
+    else if (status && status !== 'all') query = query.eq('status', status);
+    return query;
+};
+
+/**
+ * Active vs rejected registrations for the current filters (every filter but
+ * status), counted by the shared rule so the list reconciles with the event
+ * page: "183 active · 1 rejected" for a list of 184 rows.
+ */
+const summarizeRegistrations = async ({ eventIds, eventId, search, category, apartment }) => {
+    const needsJsFilter = !!(search || category || apartment);
+    const fields = needsJsFilter
+        ? "id, status, team_id, registration_no, categories, users:player_id ( first_name, last_name, player_id, apartment ), events ( name )"
+        : "id, status, team_id, categories";
+    const rows = [];
+    for (let from = 0; ; from += 1000) {
+        const { data, error } = await applyRegistrationScope(
+            supabaseAdmin.from("event_registrations").select(fields).order("id", { ascending: true }),
+            { eventIds, eventId, status: null }
+        ).range(from, from + 999);
+        if (error) throw error;
+        for (const r of data || []) {
+            if (!needsJsFilter || matchesRegistrationFilters(r, { search, category, apartment })) rows.push(r);
+        }
+        if (!data || data.length < 1000) break;
+    }
+    const { active, rejected } = tallyRegistrationEntries(rows);
+    return { active, rejected };
+};
+
+export const getRegistrations = async (req, res) => {
+    try {
+        const { eventId, page, limit } = req.query;
+        const status = req.query.status || null;
+        const search = String(req.query.search || "").trim();
+        const category = req.query.category && req.query.category !== "All Categories" ? String(req.query.category) : "";
+        const apartment = req.query.apartment && req.query.apartment !== "all" ? String(req.query.apartment) : "";
+
+        let eventIds = null;
         const scopedAdminId = resolveScopedAdminId(req);
         if (scopedAdminId) {
-            const eventIds = Array.from(await getManageableEventIds(scopedAdminId));
+            eventIds = Array.from(await getManageableEventIds(scopedAdminId));
             if (eventIds.length === 0) {
                 return res.json({ success: true, registrations: [], total_count: 0 });
             }
-            query = query.in('event_id', eventIds);
         }
 
-        if (page && limit) {
-            const pageNum = parseInt(page, 10);
-            const limitNum = parseInt(limit, 10);
+        const pageNum = page && limit ? Math.max(parseInt(page, 10) || 1, 1) : null;
+        const limitNum = page && limit ? Math.max(parseInt(limit, 10) || 20, 1) : null;
+
+        // Search, category and apartment can't be expressed reliably as
+        // PostgREST filters (player names live on users, category labels are
+        // built from jsonb that comes in several legacy shapes). So: scan a
+        // light projection of every in-scope row, filter it exactly as the page
+        // always did, then page the result and load full rows for that page.
+        // Before this the page fetched 20 rows and filtered only those, so the
+        // filters, the event list and the page count all described one page.
+        if (search || category || apartment) {
+            const matchedIds = [];
+            const CHUNK = 1000;
+            for (let from = 0; ; from += CHUNK) {
+                const { data: chunk, error: scanErr } = await applyRegistrationScope(
+                    supabaseAdmin.from("event_registrations")
+                        .select("id, registration_no, categories, users:player_id ( first_name, last_name, player_id, apartment ), events ( name )")
+                        .order('created_at', { ascending: false })
+                        .order('id', { ascending: true }),
+                    { eventIds, eventId, status }
+                ).range(from, from + CHUNK - 1);
+                if (scanErr) throw scanErr;
+                for (const row of chunk || []) {
+                    if (matchesRegistrationFilters(row, { search, category, apartment })) matchedIds.push(row.id);
+                }
+                if (!chunk || chunk.length < CHUNK) break;
+            }
+
+            const pageIds = pageNum ? matchedIds.slice((pageNum - 1) * limitNum, pageNum * limitNum) : matchedIds;
+            let registrations = [];
+            for (let i = 0; i < pageIds.length; i += 200) {
+                const { data: rows, error: rowsErr } = await supabaseAdmin
+                    .from("event_registrations").select(REGISTRATION_LIST_FIELDS).in("id", pageIds.slice(i, i + 200));
+                if (rowsErr) throw rowsErr;
+                registrations = registrations.concat(rows || []);
+            }
+            const order = new Map(pageIds.map((id, i) => [id, i]));
+            registrations.sort((a, b) => order.get(a.id) - order.get(b.id));
+
+            await attachMemberPlayerCodes(registrations);
+            const summary = await summarizeRegistrations({ eventIds, eventId, search, category, apartment });
+            return res.json({ success: true, registrations, total_count: matchedIds.length, summary });
+        }
+
+        let query = applyRegistrationScope(
+            supabaseAdmin.from("event_registrations")
+                .select(REGISTRATION_LIST_FIELDS, { count: 'exact' })
+                .order('created_at', { ascending: false })
+                .order('id', { ascending: true }),
+            { eventIds, eventId, status }
+        );
+
+        if (pageNum) {
             const from = (pageNum - 1) * limitNum;
-            const to = from + limitNum - 1;
-            query = query.range(from, to);
+            query = query.range(from, from + limitNum - 1);
         }
 
         const { data: registrations, count, error } = await query;
         if (error) throw error;
         await attachMemberPlayerCodes(registrations);
-        res.json({ success: true, registrations, total_count: count });
+        // The summary is for the paged list page only; the event page (no page
+        // param) loads every row and does not need it.
+        const summary = pageNum ? await summarizeRegistrations({ eventIds, eventId, search, category, apartment }) : undefined;
+        res.json({ success: true, registrations, total_count: count, ...(summary ? { summary } : {}) });
     } catch (err) {
         console.error("ADMIN REGISTRATIONS ERROR:", err);
         res.status(500).json({ message: "Failed to fetch registrations" });
     }
 };
 
+/**
+ * GET /api/admin/registrations/filters
+ * Options for the registrations page's Event and Category dropdowns, taken from
+ * every event the caller can see — not from whichever 20 rows are on screen,
+ * which is why the Event list used to show a single event.
+ */
+export const getRegistrationFilters = async (req, res) => {
+    try {
+        let query = supabaseAdmin.from("events")
+            .select("id, name, start_date, categories")
+            .order('start_date', { ascending: false });
+        const scopedAdminId = resolveScopedAdminId(req);
+        if (scopedAdminId) {
+            const eventIds = Array.from(await getManageableEventIds(scopedAdminId));
+            if (eventIds.length === 0) return res.json({ success: true, events: [], categories: [] });
+            query = query.in('id', eventIds);
+        }
+        const { data: events, error } = await query;
+        if (error) throw error;
+
+        const labels = new Set();
+        for (const ev of events || []) {
+            for (const c of Array.isArray(ev.categories) ? ev.categories : []) {
+                if (c) labels.add(registrationCategoryLabel(c));
+            }
+        }
+        res.json({
+            success: true,
+            events: (events || []).map((e) => ({ id: e.id, name: e.name, start_date: e.start_date })),
+            categories: [...labels].sort(),
+        });
+    } catch (err) {
+        console.error("ADMIN REGISTRATION FILTERS ERROR:", err);
+        res.status(500).json({ message: "Failed to load filters" });
+    }
+};
 const TRANSACTION_ROW_FIELDS = `
                 id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
                 events ( id, name, created_by, assigned_to ),

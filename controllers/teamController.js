@@ -1,6 +1,6 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
-import { ACTIVE_REGISTRATION_STATUSES } from "../utils/registrationRules.js";
+import { INACTIVE_STATUS_FILTER } from "../utils/registrationRules.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (value) => typeof value === "string" && UUID_RE.test(value.trim());
@@ -343,7 +343,7 @@ const activeRegistrationEventName = async (teamId) => {
         .from("event_registrations")
         .select("id, events ( name, start_date, end_date )")
         .eq("team_id", teamId)
-        .in("status", ACTIVE_REGISTRATION_STATUSES);
+        .not("status", "in", INACTIVE_STATUS_FILTER);
     if (error) throw error;
 
     const today = new Date().toISOString().slice(0, 10);
