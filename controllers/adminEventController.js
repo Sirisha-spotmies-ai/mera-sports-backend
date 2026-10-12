@@ -178,7 +178,7 @@ export const getTransactions = async (req, res) => {
         let query = supabaseAdmin.from("event_registrations")
             .select(`
                 id, event_id, player_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
-                events ( id, name, created_by, assigned_to ),
+                events ( id, name, sport, created_by, assigned_to ),
                 users:player_id ( id, first_name, last_name, player_id, mobile, email, apartment ),
                 transactions:transaction_id ( id, payment_mode, payment_id, order_id )
             `, { count: 'exact' })
