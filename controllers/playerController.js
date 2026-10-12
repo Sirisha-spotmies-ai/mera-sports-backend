@@ -238,7 +238,7 @@ export const getPlayerDashboard = async (req, res) => {
         relevantTeamIds = [...new Set(relevantTeamIds)];
 
         // Fetch Registrations
-        let query = supabaseAdmin.from("event_registrations").select(`*, events ( id, public_id, name, sport, start_date, location )`).order('created_at', { ascending: false });
+        let query = supabaseAdmin.from("event_registrations").select(`*, events ( id, public_id, name, sport, start_date, end_date, location )`).order('created_at', { ascending: false });
         if (relevantTeamIds.length > 0) {
             query = query.or(`player_id.eq.${userId},team_id.in.(${relevantTeamIds.join(',')})`);
         } else {

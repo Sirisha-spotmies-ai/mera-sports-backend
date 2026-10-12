@@ -138,7 +138,10 @@ export const getMyTeams = async (req, res) => {
         const userId = req.user.id;
 
         // 1. Teams where user is captain
-        const { data: captainTeams, error } = await supabaseAdmin.from('player_teams').select('*').eq('captain_id', userId).order('created_at', { ascending: false });
+        const { data: captainTeams, error } = await supabaseAdmin.from('player_teams').select('*').eq('captain_id', userId)
+            // Retired (deleted after use) teams are kept only for history.
+            .or('status.is.null,status.neq.deleted')
+            .order('created_at', { ascending: false });
         if (error) throw error;
 
         // 2. Teams where user is a member (lookup by UUID, mobile, or player_id)
@@ -160,6 +163,7 @@ export const getMyTeams = async (req, res) => {
                     .from('player_teams')
                     .select('*')
                     .neq('captain_id', userId)
+                    .or('status.is.null,status.neq.deleted')
                     // Must be a pre-stringified JSON array: given a JS array,
                     // supabase-js builds a Postgres *array* literal
                     // (`cs.{[object Object]}`) instead of a jsonb one.
@@ -302,6 +306,26 @@ export const createTeam = async (req, res) => {
     }
 };
 
+const firstName = (name) => String(name || "").trim().split(/\s+/)[0] || "";
+
+/** "Ravi & Raju" — the name the registration page gives a pair left unnamed. */
+const autoTeamName = (captainName, members) => {
+    const names = [firstName(captainName), ...(Array.isArray(members) ? members : []).map((m) => firstName(m?.name))].filter(Boolean);
+    return names.length > 1 ? names.join(" & ") : `${firstName(captainName) || "My"}'s team`;
+};
+
+/**
+ * Is this name just the players' first names joined ("&" or "/", any case,
+ * ignoring a trailing "[tag]" like seeded "[seed-mc]")?
+ */
+const isAutoTeamName = (teamName, captainName, members) => {
+    const names = [firstName(captainName), ...(Array.isArray(members) ? members : []).map((m) => firstName(m?.name))]
+        .filter(Boolean).map((n) => n.toLowerCase());
+    if (names.length < 2) return false;
+    const normalized = String(teamName || "").replace(/\s*\[[^\]]*\]\s*$/, "").trim().toLowerCase().replace(/\s+/g, " ");
+    return [" & ", " / ", " and "].some((sep) => normalized === names.join(sep));
+};
+
 /** Who is on a roster, order-insensitive: sorted uuid / player-code keys. */
 const memberKeySet = (members) =>
     (Array.isArray(members) ? members : [])
@@ -340,7 +364,7 @@ export const updateTeam = async (req, res) => {
         const userId = req.user.id;
 
         const { data: team, error: fetchError } = await supabaseAdmin.from('player_teams').select('*').eq('id', id).maybeSingle();
-        if (fetchError || !team) return res.status(404).json({ message: "Team not found" });
+        if (fetchError || !team || team.status === "deleted") return res.status(404).json({ message: "Team not found" });
         if (team.captain_id !== userId) return res.status(403).json({ message: "Unauthorized" });
 
         // A body without `members` (e.g. a rename) keeps the roster as it is,
@@ -366,7 +390,17 @@ export const updateTeam = async (req, res) => {
             }
         }
 
-        const { data: updatedTeam, error } = await supabaseAdmin.from('player_teams').update({ team_name, sport, members: nextMembers }).eq('id', id).select().maybeSingle();
+        // A pair named after its players ("Ravi & Raju", seeded "ravi / raju")
+        // must not keep a removed partner's name. If the name is still the
+        // auto-generated one and the captain didn't type a new one, rename it
+        // to the new roster. A name the captain chose is never touched.
+        let nextName = team_name ?? team.team_name;
+        const rosterChanged = memberKeySet(team.members).join("|") !== memberKeySet(nextMembers).join("|");
+        if (rosterChanged && nextName === team.team_name && isAutoTeamName(team.team_name, team.captain_name, team.members)) {
+            nextName = autoTeamName(team.captain_name, nextMembers);
+        }
+
+        const { data: updatedTeam, error } = await supabaseAdmin.from('player_teams').update({ team_name: nextName, sport, members: nextMembers }).eq('id', id).select().maybeSingle();
         if (error) throw error;
 
         // Find newly added members and notify them
@@ -396,26 +430,29 @@ export const deleteTeam = async (req, res) => {
         if (fetchError || !team) return res.status(404).json({ message: "Team not found" });
         if (team.captain_id !== userId) return res.status(403).json({ message: "Unauthorized" });
 
-        // Block deletion if team has active event registrations
-        const activeStatuses = [
-            'pending_verification', 'payment_pending', 'registered',
-            'pending', 'Submitted', 'confirmed', 'verified', 'approved', 'paid'
-        ];
-        const { data: activeRegs } = await supabaseAdmin
-            .from('event_registrations')
-            .select('id')
-            .eq('team_id', id)
-            .in('status', activeStatuses)
-            .limit(1);
-
-        if (activeRegs?.length > 0) {
+        // Blocked only while the team holds an active (pending or confirmed)
+        // entry in an event that has not finished. Once the event is over, or
+        // the entry was rejected/cancelled, the captain may delete it.
+        const lockedFor = await activeRegistrationEventName(id);
+        if (lockedFor) {
             return res.status(400).json({
                 success: false,
-                message: 'Cannot delete team while it is registered for an active event.'
+                code: "TEAM_LOCKED",
+                message: `"${team.team_name}" is registered for ${lockedFor}. You can delete it after the event is over, or if that registration is cancelled.`,
             });
         }
 
-        const { error } = await supabaseAdmin.from('player_teams').delete().eq('id', id);
+        // A team that was ever entered in an event is retired, not removed:
+        // event_registrations.team_id is ON DELETE SET NULL, so a hard delete
+        // would strip the partner/squad from past registrations, draws and
+        // results. Retired teams vanish from the player's lists and pickers.
+        const { data: pastRegs, error: pastErr } = await supabaseAdmin
+            .from('event_registrations').select('id').eq('team_id', id).limit(1);
+        if (pastErr) throw pastErr;
+
+        const { error } = pastRegs?.length
+            ? await supabaseAdmin.from('player_teams').update({ status: 'deleted' }).eq('id', id)
+            : await supabaseAdmin.from('player_teams').delete().eq('id', id);
         if (error) throw error;
         res.json({ success: true, message: "Team deleted successfully" });
     } catch (err) {

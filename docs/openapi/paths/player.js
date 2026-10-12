@@ -254,6 +254,38 @@ export const playerPaths = {
 
     /* ── payments ────────────────────────────────────────────────────────── */
 
+    "/api/payment/check-teams": {
+        post: {
+            tags: ["Payments"],
+            summary: "Which of my saved teams can enter this category",
+            description:
+                "Player token only. Runs the full registration rules (each member's age/gender, pair/team size, nobody already entered in the category) for every team the caller captains, against one category. Feeds the partner/team chooser.",
+            security: auth,
+            requestBody: jsonBody(
+                obj(
+                    {
+                        eventId: { oneOf: [{ type: "integer" }, { type: "string" }], example: 13 },
+                        categoryId: { type: "string", example: "1712345678901" },
+                    },
+                    ["eventId", "categoryId"]
+                )
+            ),
+            responses: {
+                ...okEnvelope("One verdict per saved team.", {
+                    teams: {
+                        type: "array",
+                        items: obj({
+                            teamId: { type: "string", format: "uuid" },
+                            eligible: { type: "boolean" },
+                            reason: { type: "string", nullable: true },
+                            code: { type: "string", nullable: true },
+                        }),
+                    },
+                }),
+                ...errors(400, 401, 403, 404, 500),
+            },
+        },
+    },
     "/api/payment/validate-registration": {
         post: {
             tags: ["Payments"],
