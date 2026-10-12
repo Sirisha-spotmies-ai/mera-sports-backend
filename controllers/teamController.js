@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
+import { ACTIVE_REGISTRATION_STATUSES } from "../utils/registrationRules.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (value) => typeof value === "string" && UUID_RE.test(value.trim());
@@ -220,7 +221,7 @@ const maskTail = (value, visible = 4, groupWith = "") => {
 export const lookupPlayer = async (req, res) => {
     try {
         const { playerId } = req.params;
-        const { data: player, error } = await supabaseAdmin.from('users').select('id, first_name, last_name, dob, mobile, player_id, aadhaar').ilike('player_id', playerId).maybeSingle();
+        const { data: player, error } = await supabaseAdmin.from('users').select('id, first_name, last_name, dob, age, gender, mobile, player_id, aadhaar').ilike('player_id', playerId).maybeSingle();
         if (error || !player) return res.status(404).json({ success: false, message: "Player ID not found" });
 
         let age = "";
@@ -228,6 +229,14 @@ export const lookupPlayer = async (req, res) => {
             const ageDt = new Date(Date.now() - new Date(player.dob).getTime());
             age = Math.abs(ageDt.getUTCFullYear() - 1970).toString();
         }
+        // Birth year + gender let the registration page check the member
+        // against a category's age/gender rule the moment they are added. The
+        // server re-checks at registration either way. Same leniency as the
+        // server: no DOB/age on file → null, and the age rule is not applied.
+        let birthYear = null;
+        const dobDate = player.dob ? new Date(player.dob) : null;
+        if (dobDate && !Number.isNaN(dobDate.getTime())) birthYear = dobDate.getFullYear();
+        else if (Number(player.age) > 0) birthYear = new Date().getFullYear() - Number(player.age);
 
         res.json({
             success: true,
@@ -239,6 +248,8 @@ export const lookupPlayer = async (req, res) => {
                 is_self: player.id === req.user?.id,
                 name: `${player.first_name} ${player.last_name}`,
                 age,
+                gender: player.gender || null,
+                birth_year: birthYear,
                 mobile: maskTail(player.mobile),
                 aadhaar: maskTail(player.aadhaar, 4, "-"),
             }
@@ -291,6 +302,37 @@ export const createTeam = async (req, res) => {
     }
 };
 
+/** Who is on a roster, order-insensitive: sorted uuid / player-code keys. */
+const memberKeySet = (members) =>
+    (Array.isArray(members) ? members : [])
+        .map((m) => String(m?.id || m?.player_id || m?.mobile || m?.name || "").trim().toLowerCase())
+        .filter(Boolean)
+        .sort();
+
+/**
+ * Name of an event this team holds an active (pending or confirmed) entry in
+ * that has not finished yet, or null. Past events do not lock the team, so a
+ * pair can be reshuffled for next season.
+ */
+const activeRegistrationEventName = async (teamId) => {
+    const { data: regs, error } = await supabaseAdmin
+        .from("event_registrations")
+        .select("id, events ( name, start_date, end_date )")
+        .eq("team_id", teamId)
+        .in("status", ACTIVE_REGISTRATION_STATUSES);
+    if (error) throw error;
+
+    const today = new Date().toISOString().slice(0, 10);
+    const live = (regs || []).find((r) => {
+        const ev = Array.isArray(r.events) ? r.events[0] : r.events;
+        const lastDay = String(ev?.end_date || ev?.start_date || "").slice(0, 10);
+        return !lastDay || lastDay >= today;
+    });
+    if (!live) return null;
+    const ev = Array.isArray(live.events) ? live.events[0] : live.events;
+    return ev?.name ? `"${ev.name}"` : "an upcoming event";
+};
+
 export const updateTeam = async (req, res) => {
     try {
         const { id } = req.params;
@@ -301,15 +343,35 @@ export const updateTeam = async (req, res) => {
         if (fetchError || !team) return res.status(404).json({ message: "Team not found" });
         if (team.captain_id !== userId) return res.status(403).json({ message: "Unauthorized" });
 
-        const memberError = validateTeamMembers(members, userId);
+        // A body without `members` (e.g. a rename) keeps the roster as it is,
+        // rather than wiping it.
+        const nextMembers = Array.isArray(members) ? members : (team.members || []);
+
+        const memberError = validateTeamMembers(nextMembers, userId);
         if (memberError) return res.status(400).json({ success: false, message: memberError });
 
-        const { data: updatedTeam, error } = await supabaseAdmin.from('player_teams').update({ team_name, sport, members: members || [] }).eq('id', id).select().maybeSingle();
+        // Roster lock: a registered pair/squad is who was entered and paid for.
+        // While the team holds an active entry in an event that has not
+        // finished, its players cannot change — otherwise the captain could
+        // swap in someone ineligible, or someone already entered in that
+        // category, after the checks ran. Renaming is still allowed.
+        if (memberKeySet(team.members).join("|") !== memberKeySet(nextMembers).join("|")) {
+            const lockedFor = await activeRegistrationEventName(id);
+            if (lockedFor) {
+                return res.status(400).json({
+                    success: false,
+                    code: "TEAM_LOCKED",
+                    message: `"${team.team_name}" is registered for ${lockedFor}, so its players can't be changed until that event is over. You can still rename the team.`,
+                });
+            }
+        }
+
+        const { data: updatedTeam, error } = await supabaseAdmin.from('player_teams').update({ team_name, sport, members: nextMembers }).eq('id', id).select().maybeSingle();
         if (error) throw error;
 
         // Find newly added members and notify them
         const oldMemberIds = new Set((team.members || []).map(m => m.id || m.player_id || m.mobile));
-        const newMembers = (members || []).filter(m => {
+        const newMembers = nextMembers.filter(m => {
             const key = m.id || m.player_id || m.mobile;
             return key && !oldMemberIds.has(key);
         });

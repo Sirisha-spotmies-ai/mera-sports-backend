@@ -172,17 +172,62 @@ export const getRegistrations = async (req, res) => {
     }
 };
 
+const TRANSACTION_ROW_FIELDS = `
+                id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
+                events ( id, name, created_by, assigned_to ),
+                users:player_id ( id, first_name, last_name, player_id, mobile, email, apartment ),
+                transactions:transaction_id ( id, payment_mode, payment_id, order_id ),
+                player_teams ( id, team_name )
+            `;
+
+/**
+ * One record per PAYMENT. A payment writes one registration row per
+ * Doubles/Team entry plus one for the singles (all sharing a transaction);
+ * the Transactions screen is about money, so those rows are shown as one line:
+ * summed amount, every category, and an `entries` breakdown (which team was
+ * entered in which category, at what fee). `id` stays the first row's id, so
+ * verify/reject keep working — the server applies them to the whole payment.
+ * Rows without a transaction (legacy) stay one record each.
+ */
+const groupRowsByPayment = (rows) => {
+    const groups = new Map();
+    for (const row of rows) {
+        const key = row.transaction_id ? `tx:${row.transaction_id}` : `row:${row.id}`;
+        if (!groups.has(key)) groups.set(key, []);
+        const list = groups.get(key);
+        if (!list.some((r) => r.id === row.id)) list.push(row);
+    }
+    return [...groups.values()].map((list) => {
+        const first = list[0];
+        const team = (r) => (Array.isArray(r.player_teams) ? r.player_teams[0] : r.player_teams) || null;
+        const unsettled = list.find((r) => r.status !== "verified");
+        return {
+            ...first,
+            status: (unsettled || first).status,
+            amount_paid: list.reduce((sum, r) => sum + (Number(r.amount_paid) || 0), 0),
+            categories: list.flatMap((r) => (Array.isArray(r.categories) ? r.categories : (r.categories ? [r.categories] : []))),
+            registration_ids: list.map((r) => r.id),
+            entries: list.map((r) => ({
+                id: r.id,
+                team_id: r.team_id || null,
+                team_name: team(r)?.team_name || null,
+                categories: r.categories,
+                amount_paid: r.amount_paid,
+                status: r.status,
+            })),
+        };
+    });
+};
+
 export const getTransactions = async (req, res) => {
     try {
         const { eventId, page, limit } = req.query;
         let query = supabaseAdmin.from("event_registrations")
-            .select(`
-                id, event_id, player_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
-                events ( id, name, created_by, assigned_to ),
-                users:player_id ( id, first_name, last_name, player_id, mobile, email, apartment ),
-                transactions:transaction_id ( id, payment_mode, payment_id, order_id )
-            `, { count: 'exact' })
-            .order('created_at', { ascending: false });
+            .select(TRANSACTION_ROW_FIELDS, { count: 'exact' })
+            .order('created_at', { ascending: false })
+            // Rows of one payment share created_at; ordering by transaction
+            // next keeps them adjacent so a page boundary rarely splits one.
+            .order('transaction_id', { ascending: true });
 
         if (eventId) query = query.eq('event_id', eventId);
         const scopedAdminId = resolveScopedAdminId(req);
@@ -202,44 +247,140 @@ export const getTransactions = async (req, res) => {
             query = query.range(from, to);
         }
 
-        const { data: transactions, count, error } = await query;
+        const { data: rows, count, error } = await query;
         if (error) throw error;
-        res.json({ success: true, transactions, total_count: count });
+
+        // A page can end part-way through a payment: fetch the rest of each
+        // payment on this page so its line shows the full amount/categories.
+        let allRows = rows || [];
+        if (page && limit) {
+            const txIds = [...new Set(allRows.map((r) => r.transaction_id).filter(Boolean))];
+            for (let i = 0; i < txIds.length; i += 100) {
+                const { data: siblings, error: sibErr } = await supabaseAdmin
+                    .from("event_registrations")
+                    .select(TRANSACTION_ROW_FIELDS)
+                    .in("transaction_id", txIds.slice(i, i + 100));
+                if (sibErr) throw sibErr;
+                allRows = allRows.concat(siblings || []);
+            }
+        }
+
+        // `total_count` stays the number of registration ROWS (what pagination
+        // and the "any registrations yet?" checks count); `row_count` is how
+        // many of those this response covers, for "loaded N of M" notices.
+        res.json({
+            success: true,
+            transactions: groupRowsByPayment(allRows),
+            total_count: count,
+            row_count: (rows || []).length,
+        });
     } catch (err) {
         console.error("ADMIN TRANSACTIONS ERROR:", err);
         res.status(500).json({ message: "Failed to fetch transactions" });
     }
 };
 
+/**
+ * Every row that belongs to the same payment as the given registration ids.
+ *
+ * One payment writes one registration row per Doubles/Team entry plus one for
+ * the singles, all sharing a transaction. The admin approves or rejects the
+ * PAYMENT — one screenshot, one amount — so a status change on any of its rows
+ * has to move all of them, or the player's receipt (which merges the rows)
+ * would be stuck half-approved.
+ */
+const expandToPaymentRows = async (ids) => {
+    const { data: rows, error } = await supabaseAdmin
+        .from("event_registrations").select("id, transaction_id").in("id", ids);
+    if (error) throw error;
+
+    const all = new Set((rows || []).map((r) => r.id));
+    const txIds = [...new Set((rows || []).map((r) => r.transaction_id).filter(Boolean))];
+    for (let i = 0; i < txIds.length; i += 100) {
+        const { data: siblings, error: sibErr } = await supabaseAdmin
+            .from("event_registrations").select("id").in("transaction_id", txIds.slice(i, i + 100));
+        if (sibErr) throw sibErr;
+        (siblings || []).forEach((s) => all.add(s.id));
+    }
+    return [...all];
+};
+
+/** Tell a partner / squad that their captain's entry was approved or rejected. */
+const notifyTeamOfStatus = async (teamId, eventName, status) => {
+    try {
+        const { data: team } = await supabaseAdmin
+            .from("player_teams").select("team_name, captain_name, members").eq("id", teamId).maybeSingle();
+        if (!team || !Array.isArray(team.members)) return;
+        const text = status === "verified"
+            ? `${team.captain_name || "Your captain"}'s registration of "${team.team_name}" for ${eventName} is confirmed — the entry fee is paid.`
+            : `${team.captain_name || "Your captain"}'s registration of "${team.team_name}" for ${eventName} was rejected by the organiser.`;
+        await Promise.allSettled(
+            team.members
+                .filter((m) => m?.id)
+                .map((m) => createNotification(
+                    m.id,
+                    status === "verified" ? "Team Registration Confirmed" : "Team Registration Rejected",
+                    text,
+                    status === "verified" ? "success" : "error",
+                    "/dashboard?tab=events"
+                ))
+        );
+    } catch (e) {
+        console.error("Team status notification error:", e.message);
+    }
+};
+
+/**
+ * Set a status on registrations — and on every other row of the same payments —
+ * then refresh caches and notify. The payer hears once per payment (not once
+ * per row); each partner / squad hears about their own entry.
+ */
+const applyRegistrationStatus = async (ids, status) => {
+    const allIds = await expandToPaymentRows(ids);
+    if (allIds.length === 0) return [];
+
+    const { data: updatedRegs, error } = await supabaseAdmin
+        .from("event_registrations")
+        .update({ status })
+        .in("id", allIds)
+        .select("id, player_id, team_id, registration_no, transaction_id, events(name)");
+    if (error) throw error;
+    const rows = updatedRegs || [];
+
+    // Invalidated together, before the notifications go out, so nobody is told
+    // their status changed while the app still shows the old one. Covers the
+    // payer and every team-mate (their dashboards list the team's entries too).
+    await Promise.allSettled(
+        rows.map((reg) => invalidateDashboardForRegistration({ userId: reg.player_id, teamId: reg.team_id }))
+    );
+
+    const statusLabel = status === "verified" ? "Verified" : "Rejected";
+    const notifiedPayments = new Set();
+    for (const reg of rows) {
+        if (reg.team_id) notifyTeamOfStatus(reg.team_id, reg.events?.name || "the event", status);
+
+        const paymentKey = reg.transaction_id || reg.id;
+        if (notifiedPayments.has(paymentKey)) continue;
+        notifiedPayments.add(paymentKey);
+
+        createNotification(
+            reg.player_id,
+            status === "verified" ? "Registration Verified" : "Registration Rejected",
+            `Your registration for ${reg.events?.name} (Reg No: ${reg.registration_no}) was ${status}.`,
+            status === "verified" ? "success" : "error"
+        );
+        // Approval is what releases the receipt: email + WhatsApp with the PDF
+        // (merged across the payment's rows).
+        if (status === "verified") notifyRegistrationApproved(reg.id);
+        else notifyRegistrationStatusWhatsApp(reg.player_id, reg.events?.name, reg.registration_no, statusLabel);
+    }
+    return rows;
+};
+
 export const verifyTransaction = async (req, res) => {
     try {
-        const { id } = req.params;
-        const { data: updatedReg, error } = await supabaseAdmin
-            .from("event_registrations")
-            .update({ status: "verified" })
-            .eq("id", id)
-            .select("player_id, team_id, registration_no, events(name)")
-            .maybeSingle();
-
-        if (error) throw error;
-        if (updatedReg) {
-            // Without this the player's cached dashboard keeps showing the old
-            // status for up to 15 minutes — they get the "verified" WhatsApp
-            // below, open the app, and still see it pending.
-            await invalidateDashboardForRegistration({
-                userId: updatedReg.player_id,
-                teamId: updatedReg.team_id,
-            });
-            createNotification(
-                updatedReg.player_id,
-                "Registration Verified",
-                `Your registration for ${updatedReg.events?.name} (Reg No: ${updatedReg.registration_no}) has been verified.`,
-                "success"
-            );
-            // Approval is what releases the receipt: email + WhatsApp with the PDF.
-            notifyRegistrationApproved(id);
-        }
-        res.json({ success: true, message: "Transaction verified" });
+        const rows = await applyRegistrationStatus([req.params.id], "verified");
+        res.json({ success: true, message: "Transaction verified", count: rows.length });
     } catch (err) {
         console.error("VERIFY ERROR:", err);
         res.status(500).json({ message: "Verification failed" });
@@ -248,29 +389,8 @@ export const verifyTransaction = async (req, res) => {
 
 export const rejectTransaction = async (req, res) => {
     try {
-        const { id } = req.params;
-        const { data: updatedReg, error } = await supabaseAdmin
-            .from("event_registrations")
-            .update({ status: "rejected" })
-            .eq("id", id)
-            .select("player_id, team_id, registration_no, events(name)")
-            .maybeSingle();
-
-        if (error) throw error;
-        if (updatedReg) {
-            await invalidateDashboardForRegistration({
-                userId: updatedReg.player_id,
-                teamId: updatedReg.team_id,
-            });
-            createNotification(
-                updatedReg.player_id,
-                "Registration Rejected",
-                `Your registration for ${updatedReg.events?.name} (Reg No: ${updatedReg.registration_no}) was rejected.`,
-                "error"
-            );
-            notifyRegistrationStatusWhatsApp(updatedReg.player_id, updatedReg.events?.name, updatedReg.registration_no, "Rejected");
-        }
-        res.json({ success: true, message: "Transaction rejected" });
+        const rows = await applyRegistrationStatus([req.params.id], "rejected");
+        res.json({ success: true, message: "Transaction rejected", count: rows.length });
     } catch (err) {
         console.error("REJECT ERROR:", err);
         res.status(500).json({ message: "Rejection failed" });
@@ -285,6 +405,8 @@ export const bulkUpdateTransactions = async (req, res) => {
 
         // An admin can only act on registrations of events they manage; the
         // rest of the selection is skipped and reported back, not failed.
+        // Rows of the same payment always share an event, so expanding to them
+        // afterwards cannot reach outside what was allowed here.
         let allowedIds = ids;
         if (req.user?.role !== 'superadmin') {
             const { data: rows, error: lookupError } = await supabaseAdmin
@@ -298,34 +420,8 @@ export const bulkUpdateTransactions = async (req, res) => {
             return res.status(403).json({ message: "None of the selected registrations belong to your events", skipped });
         }
 
-        const { data: updatedRegs, error, count } = await supabaseAdmin
-            .from("event_registrations")
-            .update({ status })
-            .in("id", allowedIds)
-            .select('id, player_id, team_id, registration_no, events(name)');
-
-        if (error) throw error;
-
-        if (updatedRegs) {
-            // Invalidated together, before the notifications go out, so nobody is
-            // told their status changed while the app still shows the old one.
-            await Promise.allSettled(
-                updatedRegs.map(reg =>
-                    invalidateDashboardForRegistration({ userId: reg.player_id, teamId: reg.team_id })
-                )
-            );
-
-            const statusLabel = status === 'verified' ? "Verified" : "Rejected";
-            updatedRegs.forEach(reg => {
-                const title = status === 'verified' ? "Registration Verified" : "Registration Rejected";
-                const type = status === 'verified' ? "success" : "error";
-                const msg = `Your registration for ${reg.events?.name} (Reg No: ${reg.registration_no}) was ${status}.`;
-                createNotification(reg.player_id, title, msg, type);
-                if (status === 'verified') notifyRegistrationApproved(reg.id);
-                else notifyRegistrationStatusWhatsApp(reg.player_id, reg.events?.name, reg.registration_no, statusLabel);
-            });
-        }
-        res.json({ success: true, message: `Transactions ${status}`, count, skipped });
+        const updated = await applyRegistrationStatus(allowedIds, status);
+        res.json({ success: true, message: `Transactions ${status}`, count: updated.length, skipped });
     } catch (err) {
         console.error("BULK UPDATE ERROR:", err);
         res.status(500).json({ message: "Batch update failed" });
