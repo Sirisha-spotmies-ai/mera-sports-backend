@@ -26,13 +26,57 @@ import { buildCategoryTarget, registrationMatchesCategory } from "./categoryMatc
 export const DEFAULT_CATEGORY_FEE = 500; // player-app fallback when a category has no fee
 
 /**
- * Statuses that hold a place in a category. Rejected / cancelled rows free it.
- * Union of the lists the event stats and team-delete guard already use.
+ * ONE definition of "an active registration", used by every count and check:
+ * any row that is not rejected/cancelled/refunded/failed. Active rows hold a
+ * place in their category (duplicate check, slots), and are what every
+ * "registrations" number on the player site, admin event page, registrations
+ * list, events list and dashboard counts. Rejected rows are reported beside it.
  */
+export const INACTIVE_REGISTRATION_STATUSES = ["rejected", "cancelled", "canceled", "refunded", "failed"];
+export const isActiveRegistrationStatus = (status) =>
+    !INACTIVE_REGISTRATION_STATUSES.includes(String(status || "").toLowerCase());
+/** PostgREST `.not("status", "in", …)` value for INACTIVE_REGISTRATION_STATUSES. */
+export const INACTIVE_STATUS_FILTER = `(${INACTIVE_REGISTRATION_STATUSES.join(",")})`;
+
+/** Kept for callers that list statuses explicitly (e.g. the dashboard's delete guard). */
 export const ACTIVE_REGISTRATION_STATUSES = [
     "verified", "paid", "confirmed", "approved", "registered",
     "pending", "Pending", "pending_verification", "payment_pending", "Submitted",
 ];
+
+/**
+ * Count registrations the one way every screen shows them.
+ *
+ * The unit is a CATEGORY ENTRY: a player in two categories is two
+ * registrations (two fees, two slots). A Doubles/Team entry is counted once
+ * per distinct team in a category, never once per member. Since Oct 2026 each
+ * new registration row holds exactly one category, so for new data entries ==
+ * rows; old rows that list several categories count once per category.
+ *
+ * Returns { active, rejected, byCategory } — byCategory holds the active count
+ * per category key (id, else name), as the per-category slot cards need.
+ */
+export const tallyRegistrationEntries = (rows) => {
+    const singles = {};
+    const teams = {};
+    let rejected = 0;
+    for (const r of rows || []) {
+        const cats = Array.isArray(r.categories) ? r.categories : (r.categories ? [r.categories] : []);
+        if (!isActiveRegistrationStatus(r.status)) {
+            rejected += Math.max(cats.length, 1);
+            continue;
+        }
+        for (const c of cats) {
+            const key = c && typeof c === "object" ? (c.id || c.name || c.category) : c;
+            if (r.team_id) (teams[key] ||= new Set()).add(String(r.team_id));
+            else singles[key] = (singles[key] || 0) + 1;
+        }
+    }
+    const byCategory = { ...singles };
+    for (const [key, set] of Object.entries(teams)) byCategory[key] = (byCategory[key] || 0) + set.size;
+    const active = Object.values(byCategory).reduce((sum, n) => sum + (Number(n) || 0), 0);
+    return { active, rejected, byCategory };
+};
 
 /** Doubles and Team categories are entered as a pair / squad. */
 export const isTeamMatchType = (matchType) => /doubles|team/i.test(String(matchType || ""));
@@ -335,7 +379,7 @@ const loadCategoryParticipants = async (event, requestedCats) => {
         .from("event_registrations")
         .select("id, player_id, team_id, categories, status")
         .eq("event_id", event.id)
-        .in("status", ACTIVE_REGISTRATION_STATUSES);
+        .not("status", "in", INACTIVE_STATUS_FILTER);
     if (error) throw error;
 
     const teamIds = [...new Set((regs || []).map((r) => r.team_id).filter(Boolean))];
@@ -544,17 +588,18 @@ export const validateRegistrationEntries = async ({ event, userId, payingUser, e
     return { fee: resolved.reduce((s, r) => s + r.fee, 0), ...buildGroups(resolved), resolved };
 };
 
-/** Rows to write: one per Doubles/Team entry, then one for all the singles. */
-const buildGroups = (resolved) => {
-    const groups = [];
-    const singles = { teamId: null, categories: [], fee: 0 };
-    for (const r of resolved) {
-        if (r.teamId) groups.push({ teamId: r.teamId, categories: [r.categoryObject], fee: r.fee });
-        else { singles.categories.push(r.categoryObject); singles.fee += r.fee; }
-    }
-    if (singles.categories.length > 0) groups.push(singles);
-    return { groups, categoryObjects: resolved.map((r) => r.categoryObject) };
-};
+/**
+ * Rows to write: ONE PER CATEGORY ENTRY — each Doubles/Team entry with its
+ * team, each singles category on its own. One row = one entry is what makes
+ * every count (event card, registrations list, events list, slots) agree: a
+ * row holding two singles categories counted as 1 in row-based lists but 2 in
+ * the entry-based slot cards. The rows still share one transaction and one
+ * registration number, so it is still one payment and one receipt.
+ */
+const buildGroups = (resolved) => ({
+    groups: resolved.map((r) => ({ teamId: r.teamId || null, categories: [r.categoryObject], fee: r.fee })),
+    categoryObjects: resolved.map((r) => r.categoryObject),
+});
 
 // ── Razorpay order notes ─────────────────────────────────────────────────────
 // Verify, the webhook and reconcile all rebuild the registration from the order
