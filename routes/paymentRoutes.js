@@ -1,9 +1,11 @@
 import express from "express";
-import { createRazorpayOrder, downloadRegistrationReceipt, getRazorpayOrderStatus, getRegistrationStatus, submitManualPayment, verifyRazorpayPayment } from "../controllers/paymentController.js";
+import { createRazorpayOrder, validateRegistration, downloadRegistrationReceipt, getRazorpayOrderStatus, getRegistrationStatus, submitManualPayment, verifyRazorpayPayment } from "../controllers/paymentController.js";
 import { authenticateUser as verifyToken } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
+// Dry run of every registration rule — called before the player pays
+router.post("/validate-registration", verifyToken, validateRegistration);
 router.post("/submit-manual-payment", verifyToken, submitManualPayment);
 router.post("/create-razorpay-order", verifyToken, createRazorpayOrder);
 router.post("/verify-razorpay-payment", verifyToken, verifyRazorpayPayment);
